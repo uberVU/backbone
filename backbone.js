@@ -138,14 +138,42 @@
     // passed the same arguments as `trigger` is, apart from the event name
     // (unless you're listening on `"all"`, which will cause your callback to
     // receive the true name of the event as the first argument).
+    //
+    // "name" is a list of events to fire separated by space. Example usage:
+    // this.trigger("event1 event2"); This will cause all callbacks bound
+    // to event1 to be fired, afterwards all callbacks bound to "all" to be
+    // fired (with the first argument set to event1), and the same for event2.
+    //
+    // @see triggerEventsAsync
     trigger: function(name) {
       if (!this._events) return this;
+      // eventsApi can no longer be called here when  a sequence of events is
+      // used on a single trigger, because we need to manage them together
+      // to make sure they are all called successively, without overlapping
+      var nextEvents = name.split(' ');
+      name = nextEvents.shift();
       var args = slice.call(arguments, 1);
-      if (!eventsApi(this, 'trigger', name, args)) return this;
+      // The arguments for the "all" callbacks need to have the current event
+      // name as the first parameter, and then succeeded by the actual args
+      var allArgs = [name].concat(args);
       var events = this._events[name];
       var allEvents = this._events.all;
-      if (events) triggerEvents(events, args);
-      if (allEvents) triggerEvents(allEvents, arguments);
+      // Unfortunately, because of the async nature of calling the callbacks,
+      // the optimized function "triggerEvents" is of no use for us
+      var self = this;
+      // Delay the first callback as well
+      _.delay(function() {
+        triggerEventsAsync(events, args, function() {
+          triggerEventsAsync(allEvents, allArgs, function() {
+            // The next event from a space-separated sequence of events is called
+            // here, after consecutively calling the specific and then generic
+            // ("all") callbacks of the previous one
+            if (nextEvents.length) {
+              self.trigger.apply(self, [nextEvents.join(' ')].concat(args));
+            }
+          });
+        });
+      }, 0);
       return this;
     },
 
@@ -207,6 +235,54 @@
       case 3: while (++i < l) (ev = events[i]).callback.call(ev.ctx, a1, a2, a3); return;
       default: while (++i < l) (ev = events[i]).callback.apply(ev.ctx, args);
     }
+  };
+
+  // This is a patched version of the original Backbone.trigger() which works
+  // asynchronously. The main use-case for this is that in Mozaic.js we can
+  // have hundreds of Backbone.View instances bound to the same events (a.k.a.
+  // the "all" event of a collection) and the page stop beings responsive if
+  // this event is delivered synchronously to all of its subscribers.
+  //
+  // Therefore, the patch makes sure that all these events are delivered
+  // with setTimeout(0) between them, recursively, like this:
+  // - For each event triggerEventsAsync is called in order to start calling
+  // the direct callbacks for this event, one after another
+  // - After all these callbacks are finished triggerEventsAsync is called
+  // again, but this time to take care of the "all" handlers
+  // - Then the same for the next event, if more than one is trigger using a
+  // space-separated event sequence
+  //
+  // This way we can have chained callbacks (and even events) with a preserved
+  // order in which they are called, but also async at the same time
+  //
+  // Highlights of this patch:
+  // - Since Backbone.trigger doesn't exactly have async semantics, your
+  // callback might end up in the air in a detached state (its being called
+  // but it is no longer in the callbacks list). This was a problem to be
+  // expected, but we didn't have any big problems with it so far
+  // - What's surprising is that you can trigger multiple events at once,
+  // something Backbone doesn't really use to harness the power of this event
+  // emitter
+  //
+  // TODO future ideas:
+  // - Create a global queue of callbacks and make Backbone.Events use
+  // that synchronously. This way we'd have the order preserved even between
+  // different events between different objects
+  var triggerEventsAsync = function(events, args, callback, i) {
+    // This is the iterating extra parameter needed for async recursion
+    i = i || 0;
+    // Empty event or already consumed list of event callbacks
+    if (!events || i >= events.length) {
+      if (_.isFunction(callback)) {
+        callback();
+      }
+      return;
+    }
+    events[i].callback.apply(events[i].ctx, args);
+    // On to the next one (in a bit...)
+    _.delay(function() {
+      triggerEventsAsync(events, args, callback, i + 1);
+    }, 0);
   };
 
   var listenMethods = {listenTo: 'on', listenToOnce: 'once'};
